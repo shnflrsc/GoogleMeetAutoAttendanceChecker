@@ -13,17 +13,17 @@ The automation runs two attendance passes on weekdays:
    - Resolves its Google Meet conference.
    - Retrieves participants who are currently active.
    - Uses Gemini only to match Meet display names to the official roster.
-   - Marks matched participants as `Present`.
+   - Marks matched participants using the configured `STATUS_PRESENT` value.
    - If nobody is active, the spreadsheet is left completely unchanged.
 
 2. **FINAL PASS**
    - Finds today's Meet conference.
    - Retrieves everyone who attended the meeting.
    - Uses Gemini to match participant names to the official roster.
-   - Existing `Present` records remain `Present`.
-   - Attendees who were not marked `Present` during the first pass become `Late`.
-   - Everyone else becomes `Unexcused`.
-   - Existing `Excused` records are never overwritten.
+   - Existing `STATUS_PRESENT` records remain unchanged.
+   - Attendees who were not marked `STATUS_PRESENT` during the first pass become `STATUS_LATE`.
+   - Everyone else becomes `STATUS_ABSENT`.
+   - Existing `STATUS_EXCUSED` records are never overwritten.
 
 Attendance decisions are deterministic and are performed by Apps Script. Gemini is used **only for name matching**, not for deciding attendance status. This separation is intentional.
 
@@ -107,14 +107,41 @@ This prevents the automation from silently changing the spreadsheet structure.
 
 ## Configuration
 
-Edit the `CONFIG` object in `Code.gs`.
+All deployment-specific configuration is stored in **Apps Script Script Properties**. The source code should not be edited when configuring the automation for another meeting or spreadsheet.
+
+In Apps Script, open:
+
+```text
+Project Settings
+    -> Script Properties
+```
+
+Create the following properties.
+
+| Property | Purpose | Example |
+|---|---|---|
+| `RECURRING_EVENT_ID` | Parent ID of the recurring Google Calendar event | `YOUR_RECURRING_EVENT_ID` |
+| `CALENDAR_ID` | Calendar containing the recurring event | `primary` |
+| `SPREADSHEET_ID` | Target attendance spreadsheet | `YOUR_SPREADSHEET_ID` |
+| `SHEET_NAME` | Attendance sheet/tab name | `Attendance Tracker` |
+| `ROSTER_COLUMN` | 1-based column containing roster names | `1` |
+| `ROSTER_START_ROW` | First row containing roster names | `2` |
+| `DATE_HEADER_ROW` | Row containing attendance dates | `1` |
+| `PRESENT_PASS_HOUR` | Hour of the PRESENT pass, 0-23 | `13` |
+| `PRESENT_PASS_MINUTE` | Minute of the PRESENT pass, 0-59 | `30` |
+| `FINAL_PASS_HOUR` | Hour of the FINAL pass, 0-23 | `15` |
+| `FINAL_PASS_MINUTE` | Minute of the FINAL pass, 0-59 | `0` |
+| `STATUS_PRESENT` | Value written for present participants | `Present` |
+| `STATUS_LATE` | Value written for late participants | `Late` |
+| `STATUS_ABSENT` | Value written for non-attendees | `Unexcused` |
+| `STATUS_EXCUSED` | Manually managed excused value | `Excused` |
+| `TIMEZONE` | Timezone for date calculations and triggers | `Asia/Manila` |
+| `GEMINI_MODEL` | Gemini model used for name matching | `gemini-3.5-flash-lite` |
+| `GEMINI_API_KEY` | Gemini API key | `<your Gemini API key>` |
+
+The script validates required properties before running. Numeric properties are also validated for valid ranges.
 
 ### Calendar / Meet
-
-```javascript
-CALENDAR_ID: 'primary',
-RECURRING_EVENT_ID: 'YOUR_RECURRING_EVENT_ID',
-```
 
 `RECURRING_EVENT_ID` must be the ID of the **parent recurring Calendar event**, not the ID of an individual occurrence.
 
@@ -130,18 +157,17 @@ The function logs each event's ID, recurring event ID, start time, and Meet link
 
 ### Spreadsheet
 
-Configure:
+Configure the spreadsheet properties to match the target attendance tracker:
 
-```javascript
-SPREADSHEET_ID: 'YOUR_SPREADSHEET_ID',
-SHEET_NAME: 'Attendance Tracker',
-
-ROSTER_COLUMN: 1,
-ROSTER_START_ROW: 2,
-DATE_HEADER_ROW: 1,
+```text
+SPREADSHEET_ID
+SHEET_NAME
+ROSTER_COLUMN
+ROSTER_START_ROW
+DATE_HEADER_ROW
 ```
 
-These are **1-based** indexes.
+`ROSTER_COLUMN`, `ROSTER_START_ROW`, and `DATE_HEADER_ROW` are **1-based** indexes.
 
 For example:
 
@@ -154,24 +180,44 @@ D = 4
 
 If names are in column A starting at row 2 and dates are in row 1:
 
-```javascript
-ROSTER_COLUMN: 1,
-ROSTER_START_ROW: 2,
-DATE_HEADER_ROW: 1,
+```text
+ROSTER_COLUMN = 1
+ROSTER_START_ROW = 2
+DATE_HEADER_ROW = 1
 ```
 
 The roster in the configured column is treated as the authoritative participant list.
 
+### Attendance Date Format
+
+The attendance dates should already exist in the configured date-header row and should be displayed using the `MMM d` format, such as:
+
+```text
+AUG 3
+AUG 4
+AUG 5
+```
+
+The year does not need to appear in the spreadsheet. The script determines the current month/day using the configured timezone and searches the configured date-header row for the matching existing column.
+
+The script **does not create missing date columns**.
+
+If today's attendance column does not exist:
+
+- an error is logged;
+- execution stops;
+- the spreadsheet is not modified.
+
 ### Attendance Times
 
-Configure the two passes:
+Configure the two passes with:
 
-```javascript
-PRESENT_PASS_HOUR: 13,
-PRESENT_PASS_MINUTE: 30,
+```text
+PRESENT_PASS_HOUR
+PRESENT_PASS_MINUTE
 
-FINAL_PASS_HOUR: 15,
-FINAL_PASS_MINUTE: 0,
+FINAL_PASS_HOUR
+FINAL_PASS_MINUTE
 ```
 
 The PRESENT pass checks currently active participants. The FINAL pass checks all participants who attended.
@@ -180,35 +226,44 @@ Google Apps Script time-based triggers execute approximately around the configur
 
 ### Attendance Statuses
 
-The current implementation uses:
+The status text is also configurable through Script Properties:
 
-```javascript
-STATUS_PRESENT: 'Present',
-STATUS_LATE: 'Late',
-STATUS_ABSENT: 'Unexcused',
-STATUS_EXCUSED: 'Excused',
+```text
+STATUS_PRESENT = Present
+STATUS_LATE    = Late
+STATUS_ABSENT  = Unexcused
+STATUS_EXCUSED = Excused
 ```
 
 These values are written to the spreadsheet exactly as configured.
 
-`Excused` is treated as a manually managed status and is never overwritten by the automation.
+This allows the same automation to work with spreadsheets that use different status terminology, for example:
+
+```text
+STATUS_PRESENT = P
+STATUS_LATE    = L
+STATUS_ABSENT  = A
+STATUS_EXCUSED = E
+```
+
+`STATUS_EXCUSED` is treated as a manually managed status and is never overwritten by the automation.
 
 ### Timezone
 
-Configure the timezone used for attendance-date calculations and triggers:
+Configure the timezone used for attendance-date calculations and triggers through:
 
-```javascript
-TIMEZONE: 'Asia/Manila',
+```text
+TIMEZONE = Asia/Manila
 ```
 
 Change this if the meeting operates in another timezone.
 
 ## Gemini Configuration
 
-Configure the Gemini model:
+Configure the Gemini model through:
 
-```javascript
-GEMINI_MODEL: 'gemini-3.5-flash-lite',
+```text
+GEMINI_MODEL = gemini-3.5-flash-lite
 ```
 
 Gemini is deliberately restricted to participant-name matching.
@@ -224,20 +279,13 @@ It handles variations such as:
 - minor spelling differences
 - common display-name variations
 
-Gemini must only match a participant to an existing roster entry. It must not invent people or determine whether someone is Present, Late, Unexcused, or Excused.
+Gemini must only match a participant to an existing roster entry. It must not invent people or determine attendance status.
 
 ## API Key
 
 Do **not** put the Gemini API key directly in `Code.gs`.
 
-In Apps Script:
-
-```text
-Project Settings
-    -> Script Properties
-```
-
-Create:
+Store it in Apps Script Script Properties:
 
 ```text
 Property: GEMINI_API_KEY
@@ -245,91 +293,6 @@ Value:    <your Gemini API key>
 ```
 
 The script reads the key using `PropertiesService`.
-
-## Apps Script Setup
-
-### 1. Create the Apps Script project
-
-Create a new Google Apps Script project and add the project source files, including `Code.gs` and `appsscript.json`.
-
-### 2. Configure `appsscript.json`
-
-The manifest must include these OAuth scopes:
-
-```json
-{
-  "oauthScopes": [
-    "https://www.googleapis.com/auth/calendar.readonly",
-    "https://www.googleapis.com/auth/meetings.space.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/script.external_request"
-  ]
-}
-```
-
-The project also requires the Google Calendar API to be added as an Apps Script advanced service:
-
-```text
-Apps Script
-    -> Services
-    -> Add a service
-    -> Google Calendar API
-```
-
-These scopes and the Calendar advanced service are required by the current implementation.
-
-### 3. Enable Google Cloud APIs
-
-In the Google Cloud project associated with the Apps Script project, enable:
-
-- Google Meet REST API
-- Google Calendar API
-
-### 4. Configure Script Properties
-
-Add:
-
-```text
-GEMINI_API_KEY=<your Gemini API key>
-```
-
-Do not commit this value to GitHub.
-
-### 5. Configure the `CONFIG` object
-
-At minimum, configure:
-
-```javascript
-const CONFIG = {
-  CALENDAR_ID: 'primary',
-  RECURRING_EVENT_ID: 'YOUR_RECURRING_EVENT_ID',
-
-  SPREADSHEET_ID: 'YOUR_SPREADSHEET_ID',
-  SHEET_NAME: 'Attendance Tracker',
-
-  ROSTER_COLUMN: 1,
-  DATE_HEADER_ROW: 1,
-  ROSTER_START_ROW: 2,
-
-  PRESENT_PASS_HOUR: 13,
-  PRESENT_PASS_MINUTE: 30,
-
-  FINAL_PASS_HOUR: 15,
-  FINAL_PASS_MINUTE: 0,
-
-  STATUS_PRESENT: 'Present',
-  STATUS_LATE: 'Late',
-  STATUS_ABSENT: 'Unexcused',
-  STATUS_EXCUSED: 'Excused',
-
-  GEMINI_MODEL: 'gemini-3.5-flash-lite',
-
-  TIMEZONE: 'Asia/Manila',
-  MEET_PAGE_SIZE: 250
-};
-```
-
-Do not publish your real spreadsheet ID if the repository is public unless that exposure is acceptable for your environment.
 
 ## Testing
 
@@ -525,6 +488,7 @@ For another deployment, change:
 
 ```text
 RECURRING_EVENT_ID
+CALENDAR_ID
 SPREADSHEET_ID
 SHEET_NAME
 ROSTER_COLUMN
@@ -534,7 +498,13 @@ PRESENT_PASS_HOUR
 PRESENT_PASS_MINUTE
 FINAL_PASS_HOUR
 FINAL_PASS_MINUTE
+STATUS_PRESENT
+STATUS_LATE
+STATUS_ABSENT
+STATUS_EXCUSED
 TIMEZONE
+GEMINI_MODEL
+GEMINI_API_KEY
 ```
 
 Then:
@@ -552,7 +522,7 @@ The attendance logic itself does not need to be rewritten for a different meetin
 - The spreadsheet roster is the authoritative participant list.
 - Gemini is only a name-variance resolver.
 - Apps Script makes all attendance-status decisions.
-- `Excused` is never overwritten.
+- The configured `STATUS_EXCUSED` value is never overwritten.
 - Missing date columns are never created automatically.
 - If today's date column is missing, execution fails without modifying the spreadsheet.
 - The configured recurring Calendar event identifies the day's Meet meeting.
