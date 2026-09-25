@@ -1,116 +1,59 @@
-const CONFIG = {
-  // ----------------------------
-  // Calendar / Meeting
-  // ----------------------------
-
-  CALENDAR_ID: 'YOUR_CALENDAR_ID',
-
-  // ID of the recurring Calendar event.
-  RECURRING_EVENT_ID: 'YOUR_RECURRING_EVENT_ID',
-
-
-  // ----------------------------
-  // Spreadsheet
-  // ----------------------------
-
-  SPREADSHEET_ID: 'YOUR_SPREADSHEET_ID',
-
-  SHEET_NAME: 'YOUR_SHEET_NAME',
-
-  // 1-based column number containing roster names.
-  // A = 1, B = 2, C = 3, etc.
-  ROSTER_COLUMN: YOUR_ROSTER_COLUMN,
-
-  // 1-based row containing attendance dates.
-  DATE_HEADER_ROW: YOUR_DATE_HEADER_ROW,
-
-  // First row containing roster names.
-  ROSTER_START_ROW: YOUR_ROSTER_START_ROW,
-
-
-  // ================================
-  // ATTENDANCE PASSES
-  // ================================
-
-  // PRESENT PASS
-  PRESENT_PASS_HOUR: YOUR_PRESENT_PASS_HOUR,
-  PRESENT_PASS_MINUTE: YOUR_PRESENT_PASS_MINUTE,
-
-  // FINAL PASS
-  FINAL_PASS_HOUR: YOUR_FINAL_PASS_HOUR,
-  FINAL_PASS_MINUTE: YOUR_FINAL_PASS_MINUTE,
-
-
-  // ----------------------------
-  // Attendance statuses
-  // ----------------------------
-
-  STATUS_PRESENT: 'Present',
-  STATUS_LATE: 'Late',
-  STATUS_ABSENT: 'Unexcused',
-  STATUS_EXCUSED: 'Excused',
-
-
-  // ----------------------------
-  // Gemini
-  // ----------------------------
-
-  GEMINI_MODEL: 'YOUR_GEMINI_MODEL',
-
-  GEMINI_API_URL:
-    'https://generativelanguage.googleapis.com/v1beta/models/',
-
-
-  // ================================
-  // GENERAL
-  // ================================
-
-  TIMEZONE: 'YOUR_TIMEZONE',
-  MEET_PAGE_SIZE: 250
-};
-
-
 /**
- * ============================================================
- * PRODUCTION ENTRY POINTS
- * ============================================================
+ * Google Meet Attendance Automation
+ *
+ * Deployment configuration is stored in Apps Script
+ * Project Settings -> Script Properties.
+ *
+ * Required properties:
+ *   RECURRING_EVENT_ID
+ *   CALENDAR_ID
+ *   SPREADSHEET_ID
+ *   SHEET_NAME
+ *   ROSTER_COLUMN
+ *   ROSTER_START_ROW
+ *   DATE_HEADER_ROW
+ *   PRESENT_PASS_HOUR
+ *   PRESENT_PASS_MINUTE
+ *   FINAL_PASS_HOUR
+ *   FINAL_PASS_MINUTE
+ *   TIMEZONE
+ *   STATUS_PRESENT
+ *   STATUS_LATE
+ *   STATUS_ABSENT
+ *   STATUS_EXCUSED
+ *   GEMINI_MODEL
+ *   GEMINI_API_KEY
+ *
+ * Gemini is used only for participant-to-roster name matching.
+ * Apps Script determines attendance status using the configured
+ * status values stored in Script Properties.
  */
 
+const GEMINI_API_URL =
+  'https://generativelanguage.googleapis.com/v1beta/models/';
+
+const MEET_PAGE_SIZE = 250;
+
+
 /**
- * Trigger entry point for the PRESENT pass.
+ * Production entry points.
  */
 function runPresentPass() {
   runAttendancePass_('PRESENT_PASS');
 }
 
-
-/**
- * Trigger entry point for the FINAL pass.
- */
 function runFinalPass() {
   runAttendancePass_('FINAL_PASS');
 }
 
 
 /**
- * ============================================================
- * PRODUCTION SETUP
- * ============================================================
- */
-
-/**
- * Run this ONCE when deploying the automation.
- *
- * It:
- *   1. Validates configuration.
- *   2. Removes previous attendance triggers.
- *   3. Creates the 10 weekday triggers.
- *
- * Running this again is safe because existing attendance
- * triggers are removed first.
+ * Creates the weekday production triggers.
+ * Safe to run repeatedly because existing attendance triggers
+ * are deleted first.
  */
 function setupProduction() {
-  validateConfiguration_();
+  const config = getConfig_(true);
 
   deleteAttendanceTriggers_();
 
@@ -126,17 +69,17 @@ function setupProduction() {
     ScriptApp.newTrigger('runPresentPass')
       .timeBased()
       .onWeekDay(day)
-      .atHour(CONFIG.PRESENT_PASS_HOUR)
-      .nearMinute(CONFIG.PRESENT_PASS_MINUTE)
-      .inTimezone(CONFIG.TIMEZONE)
+      .atHour(config.presentPassHour)
+      .nearMinute(config.presentPassMinute)
+      .inTimezone(config.timezone)
       .create();
 
     ScriptApp.newTrigger('runFinalPass')
       .timeBased()
       .onWeekDay(day)
-      .atHour(CONFIG.FINAL_PASS_HOUR)
-      .nearMinute(CONFIG.FINAL_PASS_MINUTE)
-      .inTimezone(CONFIG.TIMEZONE)
+      .atHour(config.finalPassHour)
+      .nearMinute(config.finalPassMinute)
+      .inTimezone(config.timezone)
       .create();
   });
 
@@ -145,17 +88,9 @@ function setupProduction() {
   );
 }
 
-
-/**
- * Removes only triggers belonging to this automation.
- */
 function deleteAttendanceTriggers_() {
-  const triggers =
-    ScriptApp.getProjectTriggers();
-
-  triggers.forEach(trigger => {
-    const handler =
-      trigger.getHandlerFunction();
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    const handler = trigger.getHandlerFunction();
 
     if (
       handler === 'runPresentPass' ||
@@ -165,25 +100,16 @@ function deleteAttendanceTriggers_() {
     }
   });
 
-  Logger.log(
-    'Existing attendance triggers removed.'
-  );
+  Logger.log('Existing attendance triggers removed.');
 }
 
 
 /**
- * ============================================================
- * CORE ATTENDANCE WORKFLOW
- * ============================================================
+ * Core attendance workflow.
  */
-
 function runAttendancePass_(passType) {
-  const lock =
-    LockService.getScriptLock();
+  const lock = LockService.getScriptLock();
 
-  /**
-   * Prevent simultaneous duplicate execution.
-   */
   if (!lock.tryLock(30000)) {
     throw new Error(
       'Could not obtain the script lock. Another attendance execution may already be running.'
@@ -191,156 +117,70 @@ function runAttendancePass_(passType) {
   }
 
   try {
-    validateConfiguration_();
-
+    const config = getConfig_(true);
     const now = new Date();
 
     Logger.log(
       'Starting attendance pass: ' +
-        passType
-    );
-
-    Logger.log(
-      'Execution time: ' +
+        passType +
+        ' at ' +
         now.toISOString()
     );
 
-
-    // ------------------------------------
-    // 1. Find today's Calendar occurrence
-    // ------------------------------------
-
-    const event =
-      getTodaysRecurringEvent_(now);
-
-    Logger.log(
-      'Calendar event found: ' +
-        event.summary
-    );
-
-
-    // ------------------------------------
-    // 2. Get Meet code
-    // ------------------------------------
-
-    const meetingCode =
-      extractMeetingCode_(event);
-
-    Logger.log(
-      'Meet code resolved successfully.'
-    );
-
-
-    // ------------------------------------
-    // 3. Get today's Meet conference
-    // ------------------------------------
+    const event = getTodaysRecurringEvent_(now, config);
+    const meetingCode = extractMeetingCode_(event);
 
     const conferenceRecord =
-      getTodaysConferenceRecord_(
-        meetingCode,
-        now
-      );
+      getTodaysConferenceRecord_(meetingCode, now);
 
-    Logger.log(
-      'Meet conference record found.'
-    );
-
-
-    // ------------------------------------
-    // 4. Get participant names
-    // ------------------------------------
-
-    let participantNames;
-
-    if (passType === 'PRESENT_PASS') {
-      participantNames =
-        getActiveParticipantNames_(
-          conferenceRecord.name
-        );
-    } else {
-      participantNames =
-        getAllParticipantNames_(
-          conferenceRecord.name
-        );
-    }
+    const participantNames =
+      passType === 'PRESENT_PASS'
+        ? getActiveParticipantNames_(conferenceRecord.name)
+        : getAllParticipantNames_(conferenceRecord.name);
 
     Logger.log(
       'Participant records found: ' +
         participantNames.length
     );
 
-
-    // ------------------------------------
-    // 5. 1:30 "nobody present" rule
-    // ------------------------------------
-
     if (
       passType === 'PRESENT_PASS' &&
       participantNames.length === 0
     ) {
       Logger.log(
-        'No active participants found. ' +
-          'Spreadsheet will remain unchanged.'
+        'No active participants found. Spreadsheet will remain unchanged.'
       );
-
       return;
     }
 
-
-    // ------------------------------------
-    // 6. Get roster
-    // ------------------------------------
-
-    const sheet =
-      getAttendanceSheet_();
-
-    const roster =
-      getRoster_(sheet);
+    const sheet = getAttendanceSheet_(config);
+    const roster = getRoster_(sheet, config);
 
     if (roster.length === 0) {
       throw new Error(
-        'The roster in column A is empty.'
+        'No roster names were found in the configured roster range.'
       );
     }
 
-    Logger.log(
-      'Roster size: ' +
-        roster.length
+    const dateColumn = findDateColumn_(
+      sheet,
+      now,
+      config
     );
-
-
-    // ------------------------------------
-    // 7. Find today's date column
-    // ------------------------------------
-
-    const dateColumn =
-      findDateColumn_(
-        sheet,
-        now
-      );
 
     if (dateColumn === -1) {
       throw new Error(
         'No existing attendance column was found for ' +
-          formatAttendanceDate_(now) +
+          formatAttendanceDate_(now, config) +
           '. Spreadsheet was not modified.'
       );
     }
 
-    Logger.log(
-      'Attendance column: ' +
-        columnToLetter_(dateColumn)
-    );
-
-
-    // ------------------------------------
-    // 8. Gemini name matching
-    // ------------------------------------
-
     const matchedRosterNames =
       matchParticipantsWithGemini_(
         participantNames,
-        roster
+        roster,
+        config
       );
 
     Logger.log(
@@ -348,32 +188,27 @@ function runAttendancePass_(passType) {
         matchedRosterNames.size
     );
 
-
-    // ------------------------------------
-    // 9. Deterministic attendance logic
-    // ------------------------------------
-
     if (passType === 'PRESENT_PASS') {
       applyPresentPass_(
         sheet,
         roster,
         dateColumn,
-        matchedRosterNames
+        matchedRosterNames,
+        config
       );
     } else {
       applyFinalPass_(
         sheet,
         roster,
         dateColumn,
-        matchedRosterNames
+        matchedRosterNames,
+        config
       );
     }
-
 
     Logger.log(
       'Attendance pass completed successfully.'
     );
-
   } catch (error) {
     Logger.log(
       'ATTENDANCE ERROR: ' +
@@ -381,7 +216,6 @@ function runAttendancePass_(passType) {
     );
 
     throw error;
-
   } finally {
     lock.releaseLock();
   }
@@ -389,227 +223,137 @@ function runAttendancePass_(passType) {
 
 
 /**
- * ============================================================
- * PRESENT PASS
- * ============================================================
+ * PRESENT pass:
+ * - Matched active participants -> Present
+ * - Existing Present stays Present
+ * - Existing Excused stays Excused
+ * - Everything else is left unchanged
  */
-
 function applyPresentPass_(
   sheet,
   roster,
   dateColumn,
-  matchedRosterNames
+  matchedRosterNames,
+  config
 ) {
   const range = sheet.getRange(
-    CONFIG.ROSTER_START_ROW,
+    config.rosterStartRow,
     dateColumn,
     roster.length,
     1
   );
 
-  const values =
-    range.getValues();
+  const values = range.getValues();
 
-  const updatedValues =
-    roster.map((rosterName, index) => {
+  const updatedValues = roster.map(
+    (rosterName, index) => {
+      const currentStatus = String(
+        values[index][0] || ''
+      ).trim();
 
-      const currentStatus =
-        String(
-          values[index][0] || ''
-        ).trim();
-
-
-      // Never overwrite EXCUSED.
-      if (
-        currentStatus ===
-        CONFIG.STATUS_EXCUSED
-      ) {
-        return [
-          CONFIG.STATUS_EXCUSED
-        ];
+      if (currentStatus === config.statusExcused) {
+        return [config.statusExcused];
       }
 
-
-      // Existing PRESENT remains PRESENT.
-      if (
-        currentStatus ===
-        CONFIG.STATUS_PRESENT
-      ) {
-        return [
-          CONFIG.STATUS_PRESENT
-        ];
+      if (currentStatus === config.statusPresent) {
+        return [config.statusPresent];
       }
 
-
-      // Gemini identified this roster member
-      // as currently present.
       if (
         matchedRosterNames.has(
-          normalizeName_(
-            rosterName
-          )
+          normalizeName_(rosterName)
         )
       ) {
-        return [
-          CONFIG.STATUS_PRESENT
-        ];
+        return [config.statusPresent];
       }
 
-
-      // Leave everything else untouched
-      // during the 1:30 pass.
-      return [
-        currentStatus
-      ];
-    });
-
-  range.setValues(
-    updatedValues
+      return [currentStatus];
+    }
   );
 
-  Logger.log(
-    'PRESENT pass applied.'
-  );
+  range.setValues(updatedValues);
+
+  Logger.log('PRESENT pass applied.');
 }
 
 
 /**
- * ============================================================
- * FINAL PASS
- * ============================================================
+ * FINAL pass:
+ * - Existing Present stays Present
+ * - Existing Excused stays Excused
+ * - Attended but not Present -> Late
+ * - Everyone else -> Unexcused
  */
-
 function applyFinalPass_(
   sheet,
   roster,
   dateColumn,
-  matchedRosterNames
+  matchedRosterNames,
+  config
 ) {
   const range = sheet.getRange(
-    CONFIG.ROSTER_START_ROW,
+    config.rosterStartRow,
     dateColumn,
     roster.length,
     1
   );
 
-  const values =
-    range.getValues();
+  const values = range.getValues();
 
-  const updatedValues =
-    roster.map((rosterName, index) => {
+  const updatedValues = roster.map(
+    (rosterName, index) => {
+      const currentStatus = String(
+        values[index][0] || ''
+      ).trim();
 
-      const currentStatus =
-        String(
-          values[index][0] || ''
-        ).trim();
-
-
-      // EXCUSED is manually managed.
-      // Never overwrite it.
-      if (
-        currentStatus ===
-        CONFIG.STATUS_EXCUSED
-      ) {
-        return [
-          CONFIG.STATUS_EXCUSED
-        ];
+      if (currentStatus === config.statusExcused) {
+        return [config.statusExcused];
       }
 
-
-      // Existing PRESENT remains PRESENT.
-      if (
-        currentStatus ===
-        CONFIG.STATUS_PRESENT
-      ) {
-        return [
-          CONFIG.STATUS_PRESENT
-        ];
+      if (currentStatus === config.statusPresent) {
+        return [config.statusPresent];
       }
 
-
-      // Attended, but was not present at
-      // the 1:30 pass.
       if (
         matchedRosterNames.has(
-          normalizeName_(
-            rosterName
-          )
+          normalizeName_(rosterName)
         )
       ) {
-        return [
-          CONFIG.STATUS_LATE
-        ];
+        return [config.statusLate];
       }
 
-
-      // No attendance record.
-      return [
-        CONFIG.STATUS_ABSENT
-      ];
-    });
-
-  range.setValues(
-    updatedValues
+      return [config.statusAbsent];
+    }
   );
 
-  Logger.log(
-    'FINAL pass applied.'
-  );
+  range.setValues(updatedValues);
+
+  Logger.log('FINAL pass applied.');
 }
 
 
 /**
- * ============================================================
- * CALENDAR
- * ============================================================
+ * Calendar.
  */
+function getTodaysRecurringEvent_(now, config) {
+  const dayStart = new Date(now);
+  dayStart.setHours(0, 0, 0, 0);
 
-function getTodaysRecurringEvent_(now) {
-  const dayStart =
-    new Date(now);
+  const dayEnd = new Date(now);
+  dayEnd.setHours(23, 59, 59, 999);
 
-  dayStart.setHours(
-    0,
-    0,
-    0,
-    0
+  const response = Calendar.Events.instances(
+    config.calendarId,
+    config.recurringEventId,
+    {
+      timeMin: dayStart.toISOString(),
+      timeMax: dayEnd.toISOString(),
+      showDeleted: false,
+      maxResults: 10
+    }
   );
 
-
-  const dayEnd =
-    new Date(now);
-
-  dayEnd.setHours(
-    23,
-    59,
-    59,
-    999
-  );
-
-
-  const response =
-    Calendar.Events.instances(
-      CONFIG.CALENDAR_ID,
-      CONFIG.RECURRING_EVENT_ID,
-      {
-        timeMin:
-          dayStart.toISOString(),
-
-        timeMax:
-          dayEnd.toISOString(),
-
-        showDeleted:
-          false,
-
-        maxResults:
-          10
-      }
-    );
-
-
-  const items =
-    response.items || [];
-
+  const items = response.items || [];
 
   if (items.length === 0) {
     throw new Error(
@@ -617,36 +361,27 @@ function getTodaysRecurringEvent_(now) {
     );
   }
 
+  const todayKey = Utilities.formatDate(
+    now,
+    config.timezone,
+    'yyyy-MM-dd'
+  );
 
-  const todayKey =
-    Utilities.formatDate(
-      now,
-      CONFIG.TIMEZONE,
-      'yyyy-MM-dd'
+  const matchingEvent = items.find(event => {
+    const start = getEventStartDate_(event);
+
+    if (!start) {
+      return false;
+    }
+
+    return (
+      Utilities.formatDate(
+        start,
+        config.timezone,
+        'yyyy-MM-dd'
+      ) === todayKey
     );
-
-
-  const matchingEvent =
-    items.find(event => {
-
-      const start =
-        getEventStartDate_(
-          event
-        );
-
-      if (!start) {
-        return false;
-      }
-
-      return (
-        Utilities.formatDate(
-          start,
-          CONFIG.TIMEZONE,
-          'yyyy-MM-dd'
-        ) === todayKey
-      );
-    });
-
+  });
 
   if (!matchingEvent) {
     throw new Error(
@@ -654,40 +389,21 @@ function getTodaysRecurringEvent_(now) {
     );
   }
 
-
   return matchingEvent;
 }
 
-
 function getEventStartDate_(event) {
-  if (
-    event.start &&
-    event.start.dateTime
-  ) {
-    return new Date(
-      event.start.dateTime
-    );
+  if (event.start && event.start.dateTime) {
+    return new Date(event.start.dateTime);
   }
 
-
-  if (
-    event.start &&
-    event.start.date
-  ) {
-    return new Date(
-      event.start.date +
-        'T00:00:00'
-    );
+  if (event.start && event.start.date) {
+    return new Date(event.start.date + 'T00:00:00');
   }
-
 
   return null;
 }
 
-
-/**
- * Get the Meet code from the Calendar event.
- */
 function extractMeetingCode_(event) {
   if (
     event.conferenceData &&
@@ -696,27 +412,18 @@ function extractMeetingCode_(event) {
     const videoEntry =
       event.conferenceData.entryPoints.find(
         entryPoint =>
-          entryPoint.entryPointType ===
-          'video'
+          entryPoint.entryPointType === 'video'
       );
 
-
     if (videoEntry) {
-
-      if (
-        videoEntry.meetingCode
-      ) {
+      if (videoEntry.meetingCode) {
         return videoEntry.meetingCode;
       }
 
-
-      if (
-        videoEntry.uri
-      ) {
-        const match =
-          videoEntry.uri.match(
-            /meet\.google\.com\/([a-z0-9-]+)/i
-          );
+      if (videoEntry.uri) {
+        const match = videoEntry.uri.match(
+          /meet\.google\.com\/([a-z0-9-]+)/i
+        );
 
         if (match) {
           return match[1];
@@ -725,18 +432,15 @@ function extractMeetingCode_(event) {
     }
   }
 
-
   if (event.hangoutLink) {
-    const match =
-      event.hangoutLink.match(
-        /meet\.google\.com\/([a-z0-9-]+)/i
-      );
+    const match = event.hangoutLink.match(
+      /meet\.google\.com\/([a-z0-9-]+)/i
+    );
 
     if (match) {
       return match[1];
     }
   }
-
 
   throw new Error(
     'No Google Meet code was found in the Calendar event.'
@@ -745,36 +449,17 @@ function extractMeetingCode_(event) {
 
 
 /**
- * ============================================================
- * MEET API
- * ============================================================
+ * Google Meet API.
  */
-
 function getTodaysConferenceRecord_(
   meetingCode,
   now
 ) {
-  const dayStart =
-    new Date(now);
+  const dayStart = new Date(now);
+  dayStart.setHours(0, 0, 0, 0);
 
-  dayStart.setHours(
-    0,
-    0,
-    0,
-    0
-  );
-
-
-  const dayEnd =
-    new Date(now);
-
-  dayEnd.setHours(
-    23,
-    59,
-    59,
-    999
-  );
-
+  const dayEnd = new Date(now);
+  dayEnd.setHours(23, 59, 59, 999);
 
   const filter =
     'space.meeting_code = "' +
@@ -787,20 +472,16 @@ function getTodaysConferenceRecord_(
     dayEnd.toISOString() +
     '"';
 
-
-  const response =
-    meetApiRequest_(
-      '/conferenceRecords',
-      {
-        pageSize: 100,
-        filter: filter
-      }
-    );
-
+  const response = meetApiRequest_(
+    '/conferenceRecords',
+    {
+      pageSize: 100,
+      filter: filter
+    }
+  );
 
   const records =
     response.conferenceRecords || [];
-
 
   if (records.length === 0) {
     throw new Error(
@@ -808,53 +489,27 @@ function getTodaysConferenceRecord_(
     );
   }
 
+  const eligible = records.filter(record => {
+    if (!record.startTime) {
+      return true;
+    }
 
-  const eligible =
-    records.filter(record => {
+    return new Date(record.startTime) <= now;
+  });
 
-      if (!record.startTime) {
-        return true;
-      }
-
-      return (
-        new Date(
-          record.startTime
-        ) <= now
-      );
-    });
-
-
-  if (
-    eligible.length === 0
-  ) {
+  if (eligible.length === 0) {
     return records[0];
   }
 
-
   eligible.sort(
     (a, b) =>
-      new Date(
-        b.startTime || 0
-      ) -
-      new Date(
-        a.startTime || 0
-      )
+      new Date(b.startTime || 0) -
+      new Date(a.startTime || 0)
   );
-
 
   return eligible[0];
 }
 
-
-/**
- * Get participants currently active.
- *
- * Google documents:
- *
- * latest_end_time IS NULL
- *
- * as the filter for active participants.
- */
 function getActiveParticipantNames_(
   conferenceRecordName
 ) {
@@ -864,10 +519,6 @@ function getActiveParticipantNames_(
   );
 }
 
-
-/**
- * Get every participant who attended.
- */
 function getAllParticipantNames_(
   conferenceRecordName
 ) {
@@ -877,80 +528,53 @@ function getAllParticipantNames_(
   );
 }
 
-
 function listParticipantNames_(
   conferenceRecordName,
   filter
 ) {
-  let pageToken =
-    null;
-
+  let pageToken = null;
   const names = [];
 
-
   do {
-
     const queryParams = {
-      pageSize:
-        CONFIG.MEET_PAGE_SIZE
+      pageSize: MEET_PAGE_SIZE
     };
 
-
     if (filter) {
-      queryParams.filter =
-        filter;
+      queryParams.filter = filter;
     }
-
 
     if (pageToken) {
-      queryParams.pageToken =
-        pageToken;
+      queryParams.pageToken = pageToken;
     }
 
-
-    const response =
-      meetApiRequest_(
-        '/' +
-          conferenceRecordName +
-          '/participants',
-        queryParams
-      );
-
+    const response = meetApiRequest_(
+      '/' +
+        conferenceRecordName +
+        '/participants',
+      queryParams
+    );
 
     const participants =
       response.participants || [];
 
+    participants.forEach(participant => {
+      const displayName =
+        getParticipantDisplayName_(
+          participant
+        );
 
-    participants.forEach(
-      participant => {
-
-        const displayName =
-          getParticipantDisplayName_(
-            participant
-          );
-
-
-        if (displayName) {
-          names.push(
-            displayName
-          );
-        }
+      if (displayName) {
+        names.push(displayName);
       }
-    );
-
+    });
 
     pageToken =
-      response.nextPageToken ||
-      null;
-
+      response.nextPageToken || null;
   } while (pageToken);
 
-
-  return [
-    ...new Set(names)
-  ];
+  return [...new Set(names)];
 }
-
 
 function getParticipantDisplayName_(
   participant
@@ -964,7 +588,6 @@ function getParticipantDisplayName_(
       .trim();
   }
 
-
   if (
     participant.anonymousUser &&
     participant.anonymousUser.displayName
@@ -973,7 +596,6 @@ function getParticipantDisplayName_(
       .displayName
       .trim();
   }
-
 
   if (
     participant.phoneUser &&
@@ -984,10 +606,8 @@ function getParticipantDisplayName_(
       .trim();
   }
 
-
   return null;
 }
-
 
 function meetApiRequest_(
   path,
@@ -996,22 +616,14 @@ function meetApiRequest_(
   const accessToken =
     ScriptApp.getOAuthToken();
 
-
   let url =
     'https://meet.googleapis.com/v2' +
     path;
 
-
   const params = [];
 
-
-  Object.keys(
-    queryParams || {}
-  ).forEach(key => {
-
-    const value =
-      queryParams[key];
-
+  Object.keys(queryParams || {}).forEach(key => {
+    const value = queryParams[key];
 
     if (
       value !== null &&
@@ -1025,33 +637,23 @@ function meetApiRequest_(
     }
   });
 
-
-  if (
-    params.length > 0
-  ) {
-    url +=
-      '?' +
-      params.join('&');
+  if (params.length > 0) {
+    url += '?' + params.join('&');
   }
-
 
   const response =
     UrlFetchApp.fetch(
       url,
       {
         method: 'get',
-
         headers: {
           Authorization:
             'Bearer ' +
             accessToken
         },
-
-        muteHttpExceptions:
-          true
+        muteHttpExceptions: true
       }
     );
-
 
   const status =
     response.getResponseCode();
@@ -1059,11 +661,7 @@ function meetApiRequest_(
   const body =
     response.getContentText();
 
-
-  if (
-    status < 200 ||
-    status >= 300
-  ) {
+  if (status < 200 || status >= 300) {
     throw new Error(
       'Google Meet API error ' +
         status +
@@ -1072,42 +670,21 @@ function meetApiRequest_(
     );
   }
 
-
   return JSON.parse(body);
 }
 
 
 /**
- * ============================================================
- * GEMINI
- * ============================================================
+ * Gemini.
  */
-
 function matchParticipantsWithGemini_(
   participantNames,
-  roster
+  roster,
+  config
 ) {
-  if (
-    participantNames.length === 0
-  ) {
+  if (participantNames.length === 0) {
     return new Set();
   }
-
-
-  const apiKey =
-    PropertiesService
-      .getScriptProperties()
-      .getProperty(
-        'GEMINI_API_KEY'
-      );
-
-
-  if (!apiKey) {
-    throw new Error(
-      'GEMINI_API_KEY is not configured in Script Properties.'
-    );
-  }
-
 
   const prompt =
     buildGeminiPrompt_(
@@ -1115,12 +692,10 @@ function matchParticipantsWithGemini_(
       roster
     );
 
-
   const url =
-    CONFIG.GEMINI_API_URL +
-    CONFIG.GEMINI_MODEL +
+    GEMINI_API_URL +
+    config.geminiModel +
     ':generateContent';
-
 
   const payload = {
     contents: [
@@ -1132,38 +707,28 @@ function matchParticipantsWithGemini_(
         ]
       }
     ],
-
     generationConfig: {
       temperature: 0,
-
-      responseMimeType:
-        'application/json'
+      responseMimeType: 'application/json'
     }
   };
-
 
   const response =
     UrlFetchApp.fetch(
       url,
       {
         method: 'post',
-
         contentType:
           'application/json',
-
         headers: {
           'x-goog-api-key':
-            apiKey
+            config.geminiApiKey
         },
-
         payload:
           JSON.stringify(payload),
-
-        muteHttpExceptions:
-          true
+        muteHttpExceptions: true
       }
     );
-
 
   const status =
     response.getResponseCode();
@@ -1171,11 +736,14 @@ function matchParticipantsWithGemini_(
   const body =
     response.getContentText();
 
+  if (status < 200 || status >= 300) {
+    if (status === 429) {
+      throw new Error(
+        'Gemini API quota/rate limit reached (HTTP 429). ' +
+          'No attendance decision was made.'
+      );
+    }
 
-  if (
-    status < 200 ||
-    status >= 300
-  ) {
     throw new Error(
       'Gemini API error ' +
         status +
@@ -1184,10 +752,7 @@ function matchParticipantsWithGemini_(
     );
   }
 
-
-  const json =
-    JSON.parse(body);
-
+  const json = JSON.parse(body);
 
   const responseText =
     json.candidates &&
@@ -1197,99 +762,71 @@ function matchParticipantsWithGemini_(
     json.candidates[0].content.parts[0] &&
     json.candidates[0].content.parts[0].text;
 
-
   if (!responseText) {
     throw new Error(
       'Gemini returned no usable response.'
     );
   }
 
-
   const result =
     parseGeminiJson_(
       responseText
     );
 
-
   if (
     !result ||
-    !Array.isArray(
-      result.matches
-    )
+    !Array.isArray(result.matches)
   ) {
     throw new Error(
       'Gemini response does not contain a valid matches array.'
     );
   }
 
+  const matched = new Set();
 
-  const matched =
-    new Set();
+  result.matches.forEach(match => {
+    if (
+      !match ||
+      !Number.isInteger(
+        match.rosterIndex
+      )
+    ) {
+      return;
+    }
 
+    const index =
+      match.rosterIndex;
 
-  result.matches.forEach(
-    match => {
+    if (
+      index < 0 ||
+      index >= roster.length
+    ) {
+      return;
+    }
 
-      if (
-        !match ||
-        !Number.isInteger(
-          match.rosterIndex
-        )
-      ) {
-        return;
-      }
+    const rosterName =
+      roster[index];
 
-
-      const index =
-        match.rosterIndex;
-
-
-      if (
-        index < 0 ||
-        index >= roster.length
-      ) {
-        return;
-      }
-
-
-      /**
-       * We trust only the roster index.
-       *
-       * The returned rosterName is checked against
-       * the actual roster record before accepting it.
-       */
-      const rosterName =
-        roster[index];
-
-
-      if (
-        match.rosterName &&
-        normalizeName_(
-          match.rosterName
-        ) ===
+    if (
+      match.rosterName &&
+      normalizeName_(
+        match.rosterName
+      ) ===
         normalizeName_(
           rosterName
         )
-      ) {
-        matched.add(
-          normalizeName_(
-            rosterName
-          )
-        );
-      }
+    ) {
+      matched.add(
+        normalizeName_(
+          rosterName
+        )
+      );
     }
-  );
-
+  });
 
   return matched;
 }
 
-
-/**
- * Gemini is deliberately limited to matching.
- *
- * Apps Script remains responsible for attendance status.
- */
 function buildGeminiPrompt_(
   participantNames,
   roster
@@ -1297,12 +834,9 @@ function buildGeminiPrompt_(
   return `
 You are a deterministic Google Meet attendance name-matching system.
 
-Your ONLY task is to match Google Meet participant display names
-to people in the official roster.
+Your ONLY task is to match Google Meet participant display names to people in the official roster.
 
-The participant display names may differ from the official roster
-because of:
-
+The participant display names may differ from the official roster because of:
 - capitalization differences
 - punctuation differences
 - spacing differences
@@ -1314,7 +848,6 @@ because of:
 - common display-name variations
 
 Rules:
-
 1. Match only to a person that actually exists in the official roster.
 2. Never invent a person.
 3. Never create a new roster name.
@@ -1323,11 +856,10 @@ Rules:
 6. Use contextual name reasoning where appropriate.
 7. When returning rosterName, copy the roster name exactly.
 8. rosterIndex is zero-based.
-9. Do not decide PRESENT, LATE, ABSENT, or EXCUSED.
+9. Do not decide attendance status. Apps Script applies the configured attendance statuses.
 10. Return valid JSON only.
 
 Required output format:
-
 {
   "matches": [
     {
@@ -1339,141 +871,134 @@ Required output format:
 }
 
 GOOGLE MEET PARTICIPANTS:
-${JSON.stringify(
-  participantNames,
-  null,
-  2
-)}
+${JSON.stringify(participantNames, null, 2)}
 
 OFFICIAL ROSTER:
 ${JSON.stringify(
-  roster.map(
-    (name, index) => ({
-      index: index,
-      name: name
-    })
-  ),
+  roster.map((name, index) => ({
+    index: index,
+    name: name
+  })),
   null,
   2
 )}
 `.trim();
 }
 
+function parseGeminiJson_(text) {
+  let cleaned = text.trim();
 
-function parseGeminiJson_(
-  text
-) {
-  let cleaned =
-    text.trim();
-
-
-  if (
-    cleaned.startsWith('```')
-  ) {
-    cleaned =
-      cleaned
-        .replace(
-          /^```(?:json)?/i,
-          ''
-        )
-        .replace(
-          /```$/,
-          ''
-        )
-        .trim();
+  if (cleaned.startsWith('```')) {
+    cleaned = cleaned
+      .replace(/^```(?:json)?/i, '')
+      .replace(/```$/, '')
+      .trim();
   }
 
-
-  return JSON.parse(
-    cleaned
-  );
+  return JSON.parse(cleaned);
 }
 
 
 /**
- * ============================================================
- * SPREADSHEET
- * ============================================================
+ * Spreadsheet.
  */
-
-function getAttendanceSheet_() {
+function getAttendanceSheet_(config) {
   const spreadsheet =
     SpreadsheetApp.openById(
-      CONFIG.SPREADSHEET_ID
+      config.spreadsheetId
     );
-
 
   const sheet =
     spreadsheet.getSheetByName(
-      CONFIG.SHEET_NAME
+      config.sheetName
     );
-
 
   if (!sheet) {
     throw new Error(
       'Sheet "' +
-        CONFIG.SHEET_NAME +
+        config.sheetName +
         '" does not exist.'
     );
   }
 
-
   return sheet;
 }
 
+function getRoster_(
+  sheet,
+  config
+) {
+  const lastRow =
+    sheet.getLastRow();
 
-function getRoster_(sheet) {
-  const lastRow = sheet.getLastRow();
-
-  if (lastRow < CONFIG.ROSTER_START_ROW) {
+  if (
+    lastRow <
+    config.rosterStartRow
+  ) {
     return [];
   }
 
   const numberOfRows =
-    lastRow - CONFIG.ROSTER_START_ROW + 1;
+    lastRow -
+    config.rosterStartRow +
+    1;
 
   return sheet
     .getRange(
-      CONFIG.ROSTER_START_ROW,
-      CONFIG.ROSTER_COLUMN,
+      config.rosterStartRow,
+      config.rosterColumn,
       numberOfRows,
       1
     )
     .getValues()
-    .map(row => String(row[0] || '').trim())
+    .map(row =>
+      String(
+        row[0] || ''
+      ).trim()
+    )
     .filter(Boolean);
 }
 
-
-/**
- * Find today's existing date column.
- *
- * This function NEVER creates columns.
- */
-function findDateColumn_(sheet, date) {
-  const lastColumn = sheet.getLastColumn();
+function findDateColumn_(
+  sheet,
+  date,
+  config
+) {
+  const lastColumn =
+    sheet.getLastColumn();
 
   if (lastColumn < 1) {
     return -1;
   }
 
-  const headers = sheet
-    .getRange(
-      CONFIG.DATE_HEADER_ROW,
-      1,
-      1,
-      lastColumn
-    )
-    .getDisplayValues()[0];
+  const headers =
+    sheet
+      .getRange(
+        config.dateHeaderRow,
+        1,
+        1,
+        lastColumn
+      )
+      .getDisplayValues()[0];
 
   const targetDate =
-    formatAttendanceDate_(date);
+    formatAttendanceDate_(
+      date,
+      config
+    );
 
-  for (let index = 0; index < headers.length; index++) {
-    const header = String(headers[index] || '')
-      .trim()
-      .replace(/\s+/g, ' ')
-      .toUpperCase();
+  for (
+    let index = 0;
+    index < headers.length;
+    index++
+  ) {
+    const header =
+      String(
+        headers[index] || ''
+      )
+        .trim()
+        .replace(/\s+/g, ' ')
+        .toUpperCase();
 
     if (header === targetDate) {
       return index + 1;
@@ -1483,114 +1008,210 @@ function findDateColumn_(sheet, date) {
   return -1;
 }
 
-
-function formatAttendanceDate_(date) {
+function formatAttendanceDate_(
+  date,
+  config
+) {
   return Utilities.formatDate(
     date,
-    CONFIG.TIMEZONE,
+    config.timezone,
     'MMM d'
   ).toUpperCase();
 }
 
 
 /**
- * ============================================================
- * NAME NORMALIZATION
- * ============================================================
+ * Configuration.
  */
-
-function normalizeName_(
-  name
+function getConfig_(
+  requireGeminiKey
 ) {
-  return String(
-    name || ''
-  )
+  const properties =
+    PropertiesService.getScriptProperties();
+
+  const getRequired =
+    key => {
+      const value =
+        properties.getProperty(key);
+
+      if (
+        value === null ||
+        value.trim() === ''
+      ) {
+        throw new Error(
+          'Missing Script Property: ' +
+            key
+        );
+      }
+
+      return value.trim();
+    };
+
+  const parsePositiveInteger =
+    key => {
+      const value =
+        Number(
+          getRequired(key)
+        );
+
+      if (
+        !Number.isInteger(value) ||
+        value < 1
+      ) {
+        throw new Error(
+          'Script Property ' +
+            key +
+            ' must be a positive integer.'
+        );
+      }
+
+      return value;
+    };
+
+  const parseHour =
+    key => {
+      const value =
+        Number(
+          getRequired(key)
+        );
+
+      if (
+        !Number.isInteger(value) ||
+        value < 0 ||
+        value > 23
+      ) {
+        throw new Error(
+          'Script Property ' +
+            key +
+            ' must be an hour from 0 to 23.'
+        );
+      }
+
+      return value;
+    };
+
+  const parseMinute =
+    key => {
+      const value =
+        Number(
+          getRequired(key)
+        );
+
+      if (
+        !Number.isInteger(value) ||
+        value < 0 ||
+        value > 59
+      ) {
+        throw new Error(
+          'Script Property ' +
+            key +
+            ' must be a minute from 0 to 59.'
+        );
+      }
+
+      return value;
+    };
+
+  const config = {
+    recurringEventId:
+      getRequired('RECURRING_EVENT_ID'),
+
+    calendarId:
+      getRequired('CALENDAR_ID'),
+
+    spreadsheetId:
+      getRequired('SPREADSHEET_ID'),
+
+    sheetName:
+      getRequired('SHEET_NAME'),
+
+    rosterColumn:
+      parsePositiveInteger(
+        'ROSTER_COLUMN'
+      ),
+
+    rosterStartRow:
+      parsePositiveInteger(
+        'ROSTER_START_ROW'
+      ),
+
+    dateHeaderRow:
+      parsePositiveInteger(
+        'DATE_HEADER_ROW'
+      ),
+
+    presentPassHour:
+      parseHour(
+        'PRESENT_PASS_HOUR'
+      ),
+
+    presentPassMinute:
+      parseMinute(
+        'PRESENT_PASS_MINUTE'
+      ),
+
+    finalPassHour:
+      parseHour(
+        'FINAL_PASS_HOUR'
+      ),
+
+    finalPassMinute:
+      parseMinute(
+        'FINAL_PASS_MINUTE'
+      ),
+
+    statusPresent:
+      getRequired('STATUS_PRESENT'),
+
+    statusLate:
+      getRequired('STATUS_LATE'),
+
+    statusAbsent:
+      getRequired('STATUS_ABSENT'),
+
+    statusExcused:
+      getRequired('STATUS_EXCUSED'),
+
+    timezone:
+      getRequired('TIMEZONE'),
+
+    geminiModel:
+      getRequired('GEMINI_MODEL'),
+
+    geminiApiKey:
+      requireGeminiKey
+        ? getRequired('GEMINI_API_KEY')
+        : null
+  };
+
+  return config;
+}
+
+
+/**
+ * Utility.
+ */
+function normalizeName_(name) {
+  return String(name || '')
     .normalize('NFKC')
     .trim()
     .toLowerCase()
-    .replace(
-      /[.,'’`"-]/g,
-      ''
-    )
-    .replace(
-      /\s+/g,
-      ' '
-    );
+    .replace(/[.,'’`"-]/g, '')
+    .replace(/\s+/g, ' ');
 }
 
+function columnToLetter_(column) {
+  let temp = column;
+  let letter = '';
 
-/**
- * ============================================================
- * VALIDATION
- * ============================================================
- */
-
-function validateConfiguration_() {
-  if (
-    !CONFIG.RECURRING_EVENT_ID ||
-    CONFIG.RECURRING_EVENT_ID ===
-      'PUT_RECURRING_EVENT_ID_HERE'
-  ) {
-    throw new Error(
-      'RECURRING_EVENT_ID has not been configured.'
-    );
-  }
-
-
-  if (
-    !CONFIG.SPREADSHEET_ID
-  ) {
-    throw new Error(
-      'SPREADSHEET_ID is missing.'
-    );
-  }
-
-
-  if (
-    !CONFIG.SHEET_NAME
-  ) {
-    throw new Error(
-      'SHEET_NAME is missing.'
-    );
-  }
-
-
-  if (
-    !CONFIG.GEMINI_MODEL
-  ) {
-    throw new Error(
-      'GEMINI_MODEL is missing.'
-    );
-  }
-}
-
-
-/**
- * ============================================================
- * UTILITIES
- * ============================================================
- */
-
-function columnToLetter_(
-  column
-) {
-  let temp =
-    column;
-
-  let letter =
-    '';
-
-  while (
-    temp > 0
-  ) {
+  while (temp > 0) {
     const remainder =
       (temp - 1) % 26;
 
     letter =
       String.fromCharCode(
         65 + remainder
-      ) +
-      letter;
+      ) + letter;
 
     temp =
       Math.floor(
@@ -1598,60 +1219,91 @@ function columnToLetter_(
       );
   }
 
-
   return letter;
 }
 
 
 /**
- * ============================================================
- * MANUAL TEST FUNCTIONS
- * ============================================================
+ * Manual tests.
  */
-
 function listTodaysCalendarEvents() {
+  const config =
+    getConfig_(false);
+
   const now = new Date();
 
-  const start = new Date(now);
+  const start =
+    new Date(now);
   start.setHours(0, 0, 0, 0);
 
-  const end = new Date(now);
+  const end =
+    new Date(now);
   end.setHours(23, 59, 59, 999);
 
-  const response = Calendar.Events.list(
-    CONFIG.CALENDAR_ID,
-    {
-      timeMin: start.toISOString(),
-      timeMax: end.toISOString(),
-      singleEvents: true,
-      showDeleted: false,
-      maxResults: 100
-    }
-  );
+  const response =
+    Calendar.Events.list(
+      config.calendarId,
+      {
+        timeMin:
+          start.toISOString(),
+        timeMax:
+          end.toISOString(),
+        singleEvents:
+          true,
+        showDeleted:
+          false,
+        maxResults:
+          100
+      }
+    );
 
-  const events = response.items || [];
+  const events =
+    response.items || [];
 
   events.forEach(event => {
     Logger.log(
       '\n' +
-      'SUMMARY: ' + event.summary + '\n' +
-      'ID: ' + event.id + '\n' +
-      'START: ' + JSON.stringify(event.start) + '\n' +
-      'RECURRING EVENT ID: ' + (event.recurringEventId || 'NONE') + '\n' +
-      'MEET LINK: ' + (event.hangoutLink || 'NONE')
+      'SUMMARY: ' +
+        event.summary +
+      '\n' +
+      'ID: ' +
+        event.id +
+      '\n' +
+      'START: ' +
+        JSON.stringify(
+          event.start
+        ) +
+      '\n' +
+      'RECURRING EVENT ID: ' +
+        (
+          event.recurringEventId ||
+          'NONE'
+        ) +
+      '\n' +
+      'MEET LINK: ' +
+        (
+          event.hangoutLink ||
+          'NONE'
+        )
     );
   });
 
-  Logger.log('Total events found: ' + events.length);
+  Logger.log(
+    'Total events found: ' +
+      events.length
+  );
 }
 
 function testCalendarAndMeetLookup() {
-  const now =
-    new Date();
+  const config =
+    getConfig_(false);
+
+  const now = new Date();
 
   const event =
     getTodaysRecurringEvent_(
-      now
+      now,
+      config
     );
 
   Logger.log(
@@ -1674,26 +1326,24 @@ function testCalendarAndMeetLookup() {
 
   Logger.log(
     'Meet code: ' +
-      extractMeetingCode_(
-        event
-      )
+      extractMeetingCode_(event)
   );
 }
 
-
 function testGetCurrentParticipants() {
-  const now =
-    new Date();
+  const config =
+    getConfig_(false);
+
+  const now = new Date();
 
   const event =
     getTodaysRecurringEvent_(
-      now
+      now,
+      config
     );
 
   const meetingCode =
-    extractMeetingCode_(
-      event
-    );
+    extractMeetingCode_(event);
 
   const record =
     getTodaysConferenceRecord_(
@@ -1710,11 +1360,8 @@ function testGetCurrentParticipants() {
     'Active participants:'
   );
 
-  participants.forEach(
-    name =>
-      Logger.log(
-        '- ' + name
-      )
+  participants.forEach(name =>
+    Logger.log('- ' + name)
   );
 
   Logger.log(
@@ -1723,20 +1370,20 @@ function testGetCurrentParticipants() {
   );
 }
 
-
 function testGetAllParticipants() {
-  const now =
-    new Date();
+  const config =
+    getConfig_(false);
+
+  const now = new Date();
 
   const event =
     getTodaysRecurringEvent_(
-      now
+      now,
+      config
     );
 
   const meetingCode =
-    extractMeetingCode_(
-      event
-    );
+    extractMeetingCode_(event);
 
   const record =
     getTodaysConferenceRecord_(
@@ -1753,11 +1400,8 @@ function testGetAllParticipants() {
     'All participants:'
   );
 
-  participants.forEach(
-    name =>
-      Logger.log(
-        '- ' + name
-      )
+  participants.forEach(name =>
+    Logger.log('- ' + name)
   );
 
   Logger.log(
@@ -1766,28 +1410,29 @@ function testGetAllParticipants() {
   );
 }
 
-
 function testGeminiMatching() {
-  const now =
-    new Date();
+  const config =
+    getConfig_(true);
+
+  const now = new Date();
 
   const sheet =
-    getAttendanceSheet_();
+    getAttendanceSheet_(config);
 
   const roster =
     getRoster_(
-      sheet
+      sheet,
+      config
     );
 
   const event =
     getTodaysRecurringEvent_(
-      now
+      now,
+      config
     );
 
   const meetingCode =
-    extractMeetingCode_(
-      event
-    );
+    extractMeetingCode_(event);
 
   const record =
     getTodaysConferenceRecord_(
@@ -1803,18 +1448,16 @@ function testGeminiMatching() {
   const matched =
     matchParticipantsWithGemini_(
       participants,
-      roster
+      roster,
+      config
     );
 
   Logger.log(
     'Matched roster names:'
   );
 
-  matched.forEach(
-    name =>
-      Logger.log(
-        '- ' + name
-      )
+  matched.forEach(name =>
+    Logger.log('- ' + name)
   );
 
   Logger.log(
@@ -1823,18 +1466,10 @@ function testGeminiMatching() {
   );
 }
 
-
-/**
- * Runs the actual PRESENT logic immediately.
- */
 function testPresentPassNow() {
   runPresentPass();
 }
 
-
-/**
- * Runs the actual FINAL logic immediately.
- */
 function testFinalPassNow() {
   runFinalPass();
 }
